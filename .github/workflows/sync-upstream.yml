@@ -1,0 +1,40 @@
+name: Sync From Upstream
+
+on:
+  schedule:
+    - cron: '0 2 * * *'      # 每天 UTC 02:00（北京时间 10:00）自动镜像一次
+  workflow_dispatch: {}      # 允许在 Actions 页面手动立即触发
+
+permissions:
+  contents: write            # 允许把上游内容推回本 fork
+
+concurrency:
+  group: sync-from-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Mirror all upstream branches into this fork
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # 上游地址（yetone/magpie）
+          git remote add upstream https://github.com/yetone/magpie.git
+          git fetch --prune upstream '+refs/heads/*:refs/remotes/upstream/*'
+
+          for ref in $(git for-each-ref --format='%(refname:lstrip=3)' refs/remotes/upstream); do
+            [ "$ref" = "HEAD" ] && continue
+            echo "==> mirroring: $ref"
+            git push origin "refs/remotes/upstream/$ref:refs/heads/$ref" --force
+          done
+
+          echo "Done. All upstream branches mirrored."
