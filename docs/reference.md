@@ -447,8 +447,10 @@ its end, however long the burst took to come: one whose content came in under
 a quarter of its window (`flow_ms`, from a tenth of its bytes to nine tenths,
 scaled to the whole), or that reasoned and whose answer would have come over
 20 times faster than its reasoning came before its first text (its text came
-with the burst). The time a burst takes to come is not the time it took to
-write, and that time isn't seen. History is read the same way, as it keeps the
+with the burst), or whose window was under a second after a wait over four
+times longer (`usage.HeldWindowMs`: 392 tokens 0.25 s after an 8.2 s first
+token read 1,539 tok/s from gpt-6.1-sol). The time a burst takes to come is
+not the time it took to write, and that time isn't seen. History is read the same way, as it keeps the
 reasoning, the first text and the flow; a record from before the flow was kept
 is told by its reasoning's pace alone.
 
@@ -2261,11 +2263,17 @@ The accounts that answered through the gateway in the last 30 days are
 shown, every one when none has; `magpie statusline claude` (a provider, or
 an account's email, login or name) keeps only those. It works however Claude
 Code signs in to the gateway, unlike the `anthropic-ratelimit-*` headers,
-which Claude Code reads only while signed in to claude.ai. magpie doesn't
-write it into Claude Code's settings, where another status line may be;
-add it to `~/.claude/settings.json` yourself:
-`"statusLine": {"type": "command", "command": "magpie statusline"}`. With
-the gateway not running it prints an empty line.
+which Claude Code reads only while signed in to claude.ai. The status
+line square on Claude Code's row in the Agents page (or `magpie claude
+statusline on`) turns it on: it writes `statusLine` in
+`~/.claude/settings.json` to run this magpie by its full path
+(`"statusLine": {"type": "command", "command": "/Applications/Magpie.app/Contents/MacOS/magpie statusline"}`),
+and off, or Disconnect, takes out only a status line that runs
+`magpie statusline`. A status line of the user's own (claude-hud, a script)
+is never written over: the square isn't shown while one is there, and on is
+refused. Claude Code runs a changed status line in its open sessions too,
+so nothing needs a restart. It is offered for Claude Code on this computer,
+not in a WSL distro. With the gateway not running it prints an empty line.
 
 `magpie heap [<file>]` is for a report of magpie holding too much memory: a
 macOS `sample` of the app shows Go's frames as `???`. It asks the running
@@ -2411,6 +2419,23 @@ itself, so it can be polled every second. It answers as
 `/v1/magpie/quotas` does: this machine, another only with a gateway key,
 and never a held key.
 
+Each request as it is routed, live, for a display that shows them
+(#3387): `GET /v1/magpie/route-events/snapshot` answers `cursor`, `active`
+and `routes`, the requests going now; then
+`GET /v1/magpie/route-events?after=<cursor>` streams each change after that
+cursor as server-sent events, one `route` event a change (`id` is its
+cursor, `kind` what changed, `route` the request as it is now: `id`,
+`time`, `agent`, `provider`, `model`, `attempt`, `fallback`, `phase`,
+`status`, `failed`, `ms`, `ttft_ms`). A display replaces its request of
+that `id` and drops it once `phase` is `done` or `dropped`. A 409
+`snapshot_required`, an `event: reset`, a restart of magpie or a dropped
+connection means: take a snapshot again. No session, account, key, folder,
+prompt, reply or error text is in it. It answers as `/v1/magpie/usage`
+does: this machine, another only with a gateway key while magpie is
+shared, and never a held key. Give a display a read-only key,
+`magpie gateway-key add Screen --read-only`, which can spend nothing. See
+the [route event contract](subsystems/gateway-routing.md#route-events-for-a-display).
+
 An app that calls its vendor itself, not through magpie, can report those
 calls so the Usage page counts them: `POST /v1/magpie/usage/requests` with
 `Content-Type: application/json`. The body is one record or an array of up
@@ -2436,7 +2461,8 @@ curl -s http://127.0.0.1:3425/v1/magpie/usage/requests \
   be before `ttft_ms` or after `ms`. `flow_ms` is how long the content
   took to come, from where the speed is timed: the time from a tenth of
   it to nine tenths, times 10/8 (at most `ms` × 10/8). A reply whose
-  content came in under a quarter of its window was held and let go in a
+  content came in under a quarter of its window, or whose window was under
+  a second after a wait over four times longer, was held and let go in a
   burst, and tells no speed. Leave out what you don't know.
 - **Pricing:** a record without `cost` is priced at magpie's prices for
   its provider and model.

@@ -665,7 +665,9 @@ however old, so a client's history can be backfilled.
   speed is `usage.DecodeOf`'s, as a gateway row's is, on the server
   (`Row.Decode`, the totals' `DecodeN`) and in `page.js`'s `ledDecode`. A
   row that reasoned tells none without `first_text_ms`; `ThinkPace` and,
-  with `flow_ms`, `HeldShare` tell a reply let go in a burst. `first_text_ms`
+  with `flow_ms`, `HeldShare` tell a reply let go in a burst, as does
+  `HeldWindowMs`: a window under a second after a wait over four times
+  longer. `first_text_ms`
   may not be before `ttft_ms` (the first text is content too) or after `ms`;
   `flow_ms` is the middle 80% of the content's time scaled by 10/8, as
   `firstToken.flowMs` measures it, so it is bounded by `ms` × 10/8, not
@@ -920,6 +922,23 @@ not listed is an error. See `TestClaudeSubagents`, `TestQoderSubagents`,
 `TestKimiSubagentTask`, `TestSubagentTaskReadOnlyWhenTheFileChanges`,
 `TestSubagentWithMetaTaskIsNotReadForIt`, `TestStatsReadNoSubagentFile` and
 `TestSessionSubagentTranscript`.
+
+A session's listed `resume` line is made on every listing and reads no more
+than the listing did. The line that runs when the user opens it, from the
+GUI's Terminal or the TUI, is `sessions.ResumeNow` ([`codex_resume.go`](../../internal/sessions/codex_resume.go)).
+Codex 0.166 resumes a thread only on the provider it was saved with (its
+state-database row, else its `session_meta`): on another, `codex resume`
+stops at `modelProviderMismatch`, and at `modelProviderNotConfigured` when
+config.toml has no table of that provider any more, and no flag lets a
+resume go on another provider (codex-rs `config_manager.rs`
+`load_for_resume`). So a Codex thread saved on a provider other than the
+one Codex is on runs as `codex resume -c model_provider=<its provider> <id>`
+while config.toml has that table, or it is a built-in (`openai`, `ollama`,
+…), and Codex runs it embedded, on its own provider; when the provider is
+gone, `MoveCodexProvider` moves it to the one Codex is on first (its files
+in magpie's trash), and it resumes there (mrten_95615 on Discord). A WSL
+distro's Codex session is as listed. `TestCodexResumeOnItsProvider`; both
+cases were resumed by a real Codex 0.166.0 in a sandbox `CODEX_HOME`.
 
 The Sessions page draws only main sessions on top. A session's subagents are
 folded under its row ("2 subagents"); unfolded, each is a row of its task and
