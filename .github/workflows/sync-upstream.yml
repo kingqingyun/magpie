@@ -6,7 +6,7 @@ on:
   workflow_dispatch: {}      # 允许在 Actions 页面手动立即触发
 
 permissions:
-  contents: write            # 允许把上游内容推回本 fork
+  contents: write
 
 concurrency:
   group: sync-from-upstream
@@ -16,10 +16,11 @@ jobs:
   sync:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout fork
+      - name: Checkout fork (use PAT so workflow files can be updated)
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          token: ${{ secrets.SYNC_TOKEN }}
 
       - name: Mirror all upstream branches into this fork
         run: |
