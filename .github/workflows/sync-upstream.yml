@@ -2,8 +2,8 @@ name: Sync From Upstream
 
 on:
   schedule:
-    - cron: '0 2 * * *'      # 每天 UTC 02:00（北京时间 10:00）自动镜像一次
-  workflow_dispatch: {}      # 允许在 Actions 页面手动立即触发
+    - cron: '0 2 * * *'      # 每天 UTC 02:00（北京时间 10:00）自动同步
+  workflow_dispatch: {}      # 可在 Actions 页面手动立即触发
 
 permissions:
   contents: write
@@ -16,13 +16,13 @@ jobs:
   sync:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout fork (use PAT so workflow files can be updated)
+      - name: Checkout fork (PAT so workflow files can be pushed)
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
           token: ${{ secrets.SYNC_TOKEN }}
 
-      - name: Mirror all upstream branches into this fork
+      - name: Sync all upstream branches
         run: |
           set -euo pipefail
           git config user.name  "github-actions[bot]"
@@ -32,10 +32,22 @@ jobs:
           git remote add upstream https://github.com/yetone/magpie.git
           git fetch --prune upstream '+refs/heads/*:refs/remotes/upstream/*'
 
+          DEFAULT="main"
+
           for ref in $(git for-each-ref --format='%(refname:lstrip=3)' refs/remotes/upstream); do
             [ "$ref" = "HEAD" ] && continue
-            echo "==> mirroring: $ref"
-            git push origin "refs/remotes/upstream/$ref:refs/heads/$ref" --force
+
+            if [ "$ref" = "$DEFAULT" ]; then
+              # 默认分支：合并上游，保住本同步工作流文件
+              echo "==> $ref: merge upstream (keep sync workflow)"
+              git checkout -B "$ref" "origin/$ref"
+              git merge --no-edit "upstream/$ref"
+              git push origin "$ref"
+            else
+              # 其他分支：完全镜像上游
+              echo "==> $ref: exact mirror"
+              git push origin "refs/remotes/upstream/$ref:refs/heads/$ref" --force
+            fi
           done
 
-          echo "Done. All upstream branches mirrored."
+          echo "All upstream branches processed."
