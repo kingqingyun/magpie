@@ -31,6 +31,8 @@ if (mode === "panel" && !document.body.classList.contains("linux")) $("header.to
 // `magpie web`: the page in a browser tab, with no window of the app's
 // around it — it opens links itself, and what is the desktop's is left out
 const web = !!window.bootPrefs?.web;
+// magpie web seen from another computer: localhost is the viewer's (curtinp118)
+const remotePage = web && !/^(localhost|127(\.\d+){3}|\[::1\]|::1)$/i.test(location.hostname);
 // layout.js applies the mode and platform before the header can paint.
 // Gateway mode (gatewaymode.go): magpie web on a server that is only the
 // gateway for other computers' agents leaves out this computer's agents'
@@ -409,11 +411,11 @@ function status(msg, kind = "", ms = kind === "err" ? 8000 : 3500) {
   s.classList.toggle("lift", !!msg && (!m.hidden && !m.classList.contains("out") || s.scrollWidth > s.clientWidth));
   clearTimeout(status.t);
   if (!msg) return;
-  // as long as a long one takes to read, and while the pointer is on it
+  // as long as a long one takes to read, 15s at most (water5433), and while the pointer is on it
   const end = (w) => status.t = setTimeout(() => { s.textContent = ""; s.className = "status"; }, w);
   s.onmouseenter = () => clearTimeout(status.t);
   s.onmouseleave = () => end(2000);
-  end(Math.max(ms, msg.length * 80));
+  end(Math.max(ms, Math.min(msg.length * 80, 15000)));
 }
 
 // ---------- agents view ----------
@@ -10947,16 +10949,14 @@ function detectAPIs(p, base, use) {
   return box;
 }
 
-// modelTestWhy: why a provider's models can't each be sent a test request
-// (the server's providerJSON.modelTest), in words, or "" when they can
+// modelTestWhy: why p's models can't be tested one by one (providerJSON.modelTest), or ""
 function modelTestWhy(p) {
   if (p.modelTest === "decide") return t("A classifier's models aren't sent test requests: Test under Endpoints asks Jev's endpoint for them.");
   if (p.modelTest === "own-api") return t("{name} is reached through its own API, which magpie translates each agent request for, so a test request can't be sent to it on its own. Ask the model from an agent to try it.", { name: p.name });
   return "";
 }
 
-// modelTests: what each provider's models answered Test models, by id; a
-// model still being asked is null
+// modelTests: each provider's Test models answers by id, null while asked
 const modelTests = {};
 
 // testsOn: a provider's tests under way, by run; Stop ends them on the server too (RIck)
@@ -11795,9 +11795,10 @@ function renderModels(p) {
       await loadProviders();
     } catch (e) { statusErr(e); refresh.classList.remove("busy"); }
   };
-  // each model the agents see gets a tiny request of its own: a vendor
-  // that answers can still have a model that doesn't
-  const testAll = testButton(p, t("Test models"), t("Send a tiny request to each model agents see, to find the ones that don't answer") + "\n" + t("Right-click a model to test just it"), async () => {
+  // a tiny request to each model agents see (a vendor that answers can have one that doesn't),
+  // with the first ticked key that serves it (keySeeing, water5433)
+  const byKey = p.keyList?.filter((k) => k.on)[1] ? "\n" + t("Each model is tested with the first ticked key that can serve it") : "";
+  const testAll = testButton(p, t("Test models"), t("Send a tiny request to each model agents see, to find the ones that don't answer") + byKey + "\n" + t("Right-click a model to test just it"), async () => {
     const ids = servedIds(p).filter((id) => p.decideTest || !decidesModel(p, id));
     if (!ids.length) { status(t("Pick a model first."), "err"); return; }
     const got = modelTests[p.id] = {};
@@ -11811,8 +11812,7 @@ function renderModels(p) {
     } catch (e) { delete modelTests[p.id]; testErr(e); }
     draw();
   });
-  // one model, its dot and title as Test models leaves them, the others'
-  // results kept
+  // one model, the others' results kept
   const testOne = async (id, as) => {
     const got = modelTests[p.id] = modelTests[p.id] || {};
     got[id] = null;
@@ -12278,6 +12278,7 @@ async function startSignIn(agent, risky, site, o = {}) {
     renderProviders();
     return;
   }
+  if (agent === "codex" && !site && remotePage) site = "device";
   // one on more than one site says which first
   if (subOf(agent)?.sites && !site) {
     signing = { agent, state: "site", forUser: o.user, picked: o.proxy };
@@ -12308,12 +12309,8 @@ async function startSignIn(agent, risky, site, o = {}) {
   }
 }
 
-// openSignInPage opens a sign-in's page for the window. In a browser tab
-// (magpie web: a server, Docker) that's a new tab the viewer's browser may
-// block, as it was asked for after the sign-in started, not on the click:
-// then it says so, and the page opens from Open again, a click
-// (treeMan on Discord). A tab opened without noopener is the one way to
-// learn it was blocked, so the page it opens is cut from this one at once.
+// openSignInPage: in magpie web a new tab the browser may block, then Open
+// again (treeMan); no noopener, the one way to learn it, cut at once.
 const openBlocked = "\u0000blocked";
 function openSignInPage(url) {
   if (!web) return api("open", { url });
@@ -12347,9 +12344,7 @@ async function followSignIn(id) {
   }
 }
 
-// signingKept: what a sign-in under way keeps across its updates, for Try
-// again and a proxy picked for it — its site and way, the account signed
-// in to again, the proxy picked
+// signingKept: a sign-in's site, way, account and proxy across updates
 function signingKept() {
   return { site: signing.site, method: signing.method, inputs: signing.inputs, forUser: signing.forUser, picked: signing.picked, askProxy: signing.askProxy, customProxy: signing.customProxy, openError: signing.openError, linkOnly: signing.linkOnly };
 }
@@ -12384,9 +12379,8 @@ async function signedIn(st) {
   setTimeout(() => { justAdded = ""; }, 2000);
 }
 
-// startPluginSignIn: a plugin's provider signed in to as OpenCode's
-// `auth login` does — the way to sign in, the questions that way asks,
-// then the browser (and the code its page shows, pasted back) or a key.
+// startPluginSignIn: as OpenCode's `auth login`: way, questions, then the
+// browser (its code pasted back) or a key.
 async function startPluginSignIn(sub, method, inputs = {}, o = {}) {
   const ms = sub.plugin.methods || [];
   if (!ms.length) {
@@ -12535,9 +12529,7 @@ function renderPluginAsk(sub) {
   return box;
 }
 
-// renderStepPlan: a StepFun provider's platform sign-in, which the user
-// makes in their own browser and brings here with magpie's bookmarklet,
-// kept for the provider id alone: two on one site can be two accounts
+// renderStepPlan: StepFun's platform sign-in by bookmarklet, per provider id
 function renderStepPlan(sp, id) {
   const box = el("div", "stepplan");
   if (sp.signedIn) {
@@ -12600,11 +12592,8 @@ function cancelSignIn() {
   renderProviders();
 }
 
-// A sign-in goes through the proxy its account's requests will go through,
-// so the vendor sees the account come from one place (#1663,
-// demystify0137): the sheet says which, and another can be picked, which
-// starts it again through that one and is kept as the account's proxy.
-// proxyShown is a proxy's address without the name and password in it.
+// A sign-in goes through its account's proxy (#1663); another can be
+// picked. proxyShown hides the name and password.
 function proxyShown(u) {
   return String(u || "").replace(/^([a-z][a-z0-9+.-]*:\/\/)[^@/]*@/i, "$1");
 }
@@ -12621,11 +12610,8 @@ function signInThrough(sub, v) {
   startPluginSignIn(sub, f?.method, f?.inputs || {}, o);
 }
 
-// signInProxyChoices: the proxies a sign-in can go through — the global
-// one, none, the subscription's, the ones its other accounts go through,
-// or one typed in. The global one is left out while the subscription has
-// a proxy of its own and other accounts: an account can't be kept on the
-// global proxy then.
+// signInProxyChoices: global, none, the subscription's, its accounts', or
+// typed; no global while the subscription has its own and accounts.
 function signInProxyChoices(sub) {
   const p = providers?.providers?.find((x) => x.account?.agent === sub.agent);
   const own = (p?.proxy || "").trim();
@@ -12696,9 +12682,7 @@ function signInProxyForm(sub) {
   return form;
 }
 
-// A Copilot account on GitHub Enterprise Cloud with data residency signs in
-// at its enterprise's <name>.ghe.com, not github.com (#723): the device
-// code's panel offers that, and the host is asked in place of the code.
+// A Copilot account with data residency signs in at <name>.ghe.com (#723).
 const GHE_HOST = /^(https?:\/\/)?[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.ghe\.com\/?$/i;
 
 // copilotHostSwitch: the link from a Copilot sign-in to the other place it
@@ -12726,10 +12710,8 @@ async function signAsk(flow) {
 }
 const startClaudeToken = () => signAsk({ agent: "claude", state: "token", token: "" });
 
-// dropSigningIn: the editor of provider id closing (Cancel, Save, Remove)
-// leaves no sign-in of its account waiting behind it, to come back with the
-// editor (#526: 无论我点击底部的移除、取消、保存都没办法); an import being
-// read is left to finish.
+// dropSigningIn: an editor closing leaves no sign-in waiting (#526); an
+// import being read finishes.
 function dropSigningIn(id) {
   const p = typeof id === "string" && providers?.providers?.find((x) => x.id === id);
   if (!p?.account || !signing || signing.agent !== p.account.agent || signing.state === "importing") return;
@@ -12739,6 +12721,14 @@ function dropSigningIn(id) {
 
 // renderSigning: where a sign-in stands, in place of the button that
 // started it — waiting on the browser, or what went wrong.
+// ChatGPT's other way in: the browser's, or a code on its device page (codex_device_signin.go)
+function codexWay(sub, device, o) {
+  const b = el("button", "link codex-way", device ? t("Sign in in the browser instead") : t("Sign in with a code instead"));
+  b.dataset.way = device ? "browser" : "device";
+  if (!device) b.title = t("For magpie on a server or in Docker: enter a code on ChatGPT's page, with no address to copy back");
+  b.onclick = () => startSignIn(sub.agent, true, b.dataset.way, o);
+  return b;
+}
 function renderSigning(sub) {
   const box = el("div", "signing" + (signing.state === "failed" ? " failed" : ""));
   const tt = el("span", "tt");
@@ -12816,6 +12806,7 @@ function renderSigning(sub) {
     const acts = el("span", "acts");
     const ghe = copilotHostSwitch(sub);
     if (ghe) acts.append(ghe);
+    if (sub.agent === "codex" && !sub.plugin && signing.site === "device") acts.append(codexWay(sub, true, o));
     acts.append(signInProxyLink(sub));
     tt.append(acts);
     if (signing.askProxy) tt.append(signInProxyForm(sub));
@@ -12839,6 +12830,7 @@ function renderSigning(sub) {
       : signing.openError ? t("magpie couldn't open your browser: {error}. Open the sign-in link below in a browser yourself.", { error: signing.openError })
       : sub.plugin ? (signing.instructions || (signing.pasteCode ? t("magpie opened the sign-in page. Paste the code it shows below.") : t("magpie opened the sign-in page. The account shows up here as soon as you're done.")))
       : signing.pasteCode ? t("magpie opened the sign-in page. Paste the code it shows below.")
+      : signing.code && sub.agent === "codex" ? t("magpie opened ChatGPT's device page. Enter this code there; the account shows up here as soon as you're done.")
       : signing.code && sub.agent === "factory" ? t("magpie opened Factory's sign-in page. Check it shows this code and confirm it; the account shows up here as soon as you're done.")
       : signing.code ? t("magpie opened GitHub's device page. Enter this code there; the account shows up here as soon as you're done.") : t("magpie opened the sign-in page. The account shows up here as soon as you're done.")));
   if (signing.code) {
@@ -12968,6 +12960,8 @@ function renderSigning(sub) {
     };
     acts.append(other);
   }
+  if (sub.agent === "codex" && !sub.plugin && signing.state === "waiting")
+    (tt.querySelector(".acts") || tt.appendChild(el("span", "acts"))).append(codexWay(sub, signing.site === "device", { user: signing.forUser, proxy: signing.picked }));
   if (sub.importable) {
     // an account another tool is signed in to comes in from its file
     const imp = el("button", "link", importSay(sub.agent).instead || t("Import from a file instead…"));
@@ -19481,10 +19475,10 @@ function setSetTab(tab, remember) {
     if (b) setSetTab(b.dataset.set, true);
   };
   tabKeys(tabs, "button[data-set]");
-  // the tabs held at the top (app.css, #2396): a hairline under them once
-  // the page has scrolled beneath, as the Library's
+  // held tabs (#2396): a hairline once scrolled under
   const sv = $("#view-settings"), head = sv.querySelector(":scope > .set-head");
   sv.addEventListener("scroll", () => head.classList.toggle("stuck", sv.scrollTop > 0), { passive: true });
+  import("./settingshints.js").catch(() => {});
   // opened on a part (a reload, a link): that part, and remembered
   if (mode === "window" && params.get("view") === "settings" && SET_TABS.includes(params.get("tab"))) {
     setTab = params.get("tab");
@@ -20031,6 +20025,7 @@ async function renderSync(v) {
   // a failure is shown whole: what the server sent and what to do don't
   // fit one line
   if (v.error) sub.classList.add("bad", "wraps");
+  if (v.on) sub.classList.add("say");
   // usage that couldn't be shared is a line of its own, in red: beside
   // "Synced" in the same grey it read as part of a sync that went fine
   // (#1259)
@@ -20060,8 +20055,8 @@ async function renderSync(v) {
     else if (n.here?.length) lines.push(t("Replaced here by newer ones from another computer: {parts}", { parts: parts(n.here) }));
     if (n.there?.length) lines.push(t("Replaced on the server by this computer's newer ones: {parts}", { parts: parts(n.there) }));
     const who = el("div", "who");
-    for (const l of lines) who.append(el("div", "sub", l));
-    who.append(el("div", "sub", t(n.restored ? "This computer's setup from before is kept in the sync folder." : "The copies replaced are kept in the sync folder.")));
+    for (const l of lines) who.append(el("div", "sub say", l));
+    who.append(el("div", "sub say", t(n.restored ? "This computer's setup from before is kept in the sync folder." : "The copies replaced are kept in the sync folder.")));
     const val = el("div", "val");
     if (n.restored && v.undo) val.append(btn(t("Undo"), async (e) => {
       e.target.classList.add("busy");
@@ -21868,11 +21863,8 @@ function renderRedact(s, keep) {
   }
 }
 
-// privacyModelRow: the local masking model (internal/pii), downloaded when
-// it is turned on and then asked beside the rules. Its state is its own
-// (privacy-model): read when the row is drawn, and each second while it
-// downloads or starts. Under it, once the model can run, its threshold
-// (pmScore).
+// privacyModelRow: the local masking model (internal/pii); its state read
+// on drawing, each second while it downloads or starts; then pmScore.
 let pmState = null, pmTimer = 0;
 function privacyModelRow(box, why) {
   const r = el("div", "row pref" + (why ? " pm-wait" : ""));
@@ -21885,7 +21877,7 @@ function privacyModelRow(box, why) {
   if (why) {
     clearTimeout(pmTimer);
     const who = el("div", "who");
-    who.append(name(), el("div", "sub", why));
+    who.append(name(), el("div", "sub say", why));
     r.append(who);
     return;
   }
@@ -21893,7 +21885,7 @@ function privacyModelRow(box, why) {
   const draw = (m) => {
     if (!r.isConnected) return;
     const who = el("div", "who"), val = el("div", "val");
-    who.append(name(), el("div", "sub", pmSub(m)));
+    who.append(name(), el("div", m && (m.on || m.installed || !m.supported || pmBusy(m) || m.error || m.models?.some((x) => x.error)) ? "sub say" : "sub", pmSub(m)));
     if (m?.supported || m?.installed) {
       if (m.models?.length > 1) val.append(pmPick(m, (id) => act("pick", id)));
       if (pmBusy(m)) {
@@ -22358,7 +22350,7 @@ async function renderUpdate(r, u) {
   if (u == null) {
     const bare = !r.querySelector(".sub"), early = bare && !updateBusy && Date.now() - updateLast?.at < 3e4;
     if (early) renderUpdate(r, updateLast);
-    else if (bare) r.querySelector(".who").append(el("div", "sub", "\u00a0"));
+    else if (bare) r.querySelector(".who").append(el("div", "sub say", "\u00a0"));
     u = await api(updatePath("update?fresh=1")).catch(() => null);
     if (!u || !r.isConnected || seqOf(r) !== seq) return;
     if (early) updateSeq.set(r, seq + 1); // stops timers
@@ -22366,6 +22358,7 @@ async function renderUpdate(r, u) {
   updateLast = u, u.at ??= Date.now();
   const who = r.querySelector(".who"), val = r.querySelector(".val");
   const sub = who.querySelector(".sub") || who.appendChild(el("div", "sub"));
+  sub.classList.add("say");
   sub.title = "";
   sub.classList.remove("wraps");
   // the release page's button outlives a redraw: a download redraws every
