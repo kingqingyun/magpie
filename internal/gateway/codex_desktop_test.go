@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"io"
@@ -8,11 +9,13 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/yetone/magpie/internal/catalog"
 	"github.com/yetone/magpie/internal/provider"
 )
 
@@ -28,7 +31,7 @@ func codexDeskReset(t *testing.T) {
 			<-done
 		}
 		codexDesk.Lock()
-		codexDesk.body, codexDesk.got, codexDesk.tried, codexDesk.asking, codexDesk.done, codexDesk.revoked = nil, time.Time{}, time.Time{}, false, nil, false
+		codexDesk.body, codexDesk.got, codexDesk.tried, codexDesk.asking, codexDesk.done, codexDesk.revoked, codexDesk.failed = nil, time.Time{}, time.Time{}, false, nil, false, false
 		codexDesk.who, codexDesk.asked, codexDesk.want = "", "", ""
 		codexDesk.Unlock()
 	}
@@ -198,5 +201,263 @@ func TestCodexDesktopCatalogFollowsTheSignIn(t *testing.T) {
 	}
 	if b, ok := CodexDesktopCatalog(); !ok || !has(b, "gpt-6.1-sol") {
 		t.Fatalf("the Pro account's list: %v\n%s", ok, b)
+	}
+}
+
+// A model the vendor lists after the picks were saved (OpenAI listed
+// GPT-6.1 Terra to ChatGPT accounts on 10-26) stays in the account's own
+// list: the picks it is narrowed by are the picks with those listed since
+// (provider.Picks), as magpie's catalog serves them — or the file and the
+// list Codex reads froze at what was listed when the user picked, while
+// /v1/models had the model (wenzijie2002: codex/gpt-6.1-terra picked in
+// magpie, the Codex app's picker without it, the log "fetched its list
+// again, 8 models" and 7 in the file).
+func TestCodexDesktopCatalogKeepsNewlyListedBesidePicks(t *testing.T) {
+	codexSignedIn(t)
+	codexDeskReset(t)
+	list := `{"models":[{"slug":"gpt-6-sol","priority":1,"visibility":"list"}]}`
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, list)
+	}))
+	defer up.Close()
+	was := provider.CodexBase
+	provider.CodexBase = up.URL + "/backend-api/codex"
+	defer func() { provider.CodexBase = was }()
+
+	// picks saved while the account listed gpt-6-sol alone
+	p, err := provider.Find("codex")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.Fetch(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := provider.Save(provider.Provider{ID: "codex", Models: []string{"gpt-6-sol"}}); err != nil {
+		t.Fatal(err)
+	}
+
+	// gpt-6.1-terra listed since; the account's list asked for again
+	list = `{"models":[{"slug":"gpt-6-sol","priority":1,"visibility":"list"},` +
+		`{"slug":"gpt-6.1-terra","priority":2,"visibility":"list","base_instructions":"You are Codex, based on GPT-6.1 Terra."}]}`
+	if _, err := p.Fetch(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	CodexDesktopCatalog()
+	codexDeskAsked(t)
+	b, ok := CodexDesktopCatalog()
+	if !ok {
+		t.Fatal("not known after the backend answered")
+	}
+	var got struct {
+		Models []map[string]any `json:"models"`
+	}
+	if err := json.Unmarshal(b, &got); err != nil {
+		t.Fatal(err)
+	}
+	var own []string
+	for _, m := range got.Models {
+		if s, _ := m["slug"].(string); slices.Contains([]string{"gpt-6-sol", "gpt-6.1-terra"}, s) {
+			own = append(own, s)
+		}
+	}
+	if !slices.Equal(own, []string{"gpt-6-sol", "gpt-6.1-terra"}) {
+		t.Errorf("the account's own models beside the picks: %v\n%s", own, b)
+	}
+}
+
+// A backend that can't be reached from here (a firewall, a proxy that
+// leaves chatgpt.com out; not_4O4 on X, Windows) never gave a list, so the
+// file for the Codex app was never written and its picker had GPT alone
+// beside the sign-in. Once the ask has failed with no list from before,
+// Codex's own last list (models_cache.json) stands in, with magpie's
+// models after it; with no such cache the file stays as it was.
+func TestCodexDesktopCatalogBackendUnreachable(t *testing.T) {
+	codexSignedIn(t)
+	codexDeskReset(t)
+	if err := provider.Save(provider.Provider{ID: "relay", Name: "Relay", Key: "k", Anthropic: "http://127.0.0.1:1",
+		Models: []string{"claude-opus-5.5"}}); err != nil {
+		t.Fatal(err)
+	}
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "down", http.StatusBadGateway)
+	}))
+	defer up.Close()
+	was := provider.CodexBase
+	provider.CodexBase = up.URL + "/backend-api/codex"
+	defer func() { provider.CodexBase = was }()
+	var changed atomic.Int32
+	CodexDesktopChanged = func() { changed.Add(1) }
+
+	// no cache either: unknown, the file as it was
+	if _, ok := CodexDesktopCatalog(); ok {
+		t.Fatal("known before the backend answered")
+	}
+	codexDeskAsked(t)
+	if b, ok := CodexDesktopCatalog(); ok {
+		t.Fatalf("no list and no cache, yet known: %s", b)
+	}
+	if changed.Load() != 1 {
+		t.Fatalf("the failed ask told %d times, want once", changed.Load())
+	}
+
+	if err := os.WriteFile(catalog.CodexModelsCache(),
+		[]byte(`{"etag":"x","models":[{"slug":"gpt-5.5","priority":1,"base_instructions":"You are Codex, based on GPT-5.","visibility":"list"}]}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	codexDesk.Lock()
+	codexDesk.tried = time.Time{}
+	codexDesk.Unlock()
+	CodexDesktopCatalog()
+	codexDeskAsked(t)
+	b, ok := CodexDesktopCatalog()
+	if !ok {
+		t.Fatal("the cached list does not stand in for a backend that can't be reached")
+	}
+	if !strings.Contains(string(b), `"gpt-5.5"`) || !strings.Contains(string(b), "relay/claude-opus-5.5") {
+		t.Fatalf("want Codex's cached GPT and magpie's models:\n%s", b)
+	}
+}
+
+// ANAGABRIELRLki on X: OpenAI listed GPT-6.2 Astra on 11-17, and the Codex
+// app beside magpie never showed it. With model_catalog_json named, Codex
+// asks for no list of its own, so magpie's file is all the app has. The
+// list was asked for again only when magpie wrote the agents' files and
+// found it an hour old, which nothing makes it do on a quiet magpie, and a
+// list asked for an older Codex, or older than the sign-in's own list
+// magpie keeps, stood its hour. Each of those asks again now, and the
+// gateway's loop asks with no sync to start it.
+func TestCodexDesktopCatalogAskedAgainForANewModel(t *testing.T) {
+	codexSignedIn(t)
+	codexDeskReset(t)
+	var asks atomic.Int32
+	var list atomic.Value
+	list.Store(`{"models":[{"slug":"gpt-6.1-sol","priority":1,"visibility":"list","base_instructions":"You are Codex."}]}`)
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		asks.Add(1)
+		io.WriteString(w, list.Load().(string))
+	}))
+	defer up.Close()
+	was := provider.CodexBase
+	provider.CodexBase = up.URL + "/backend-api/codex"
+	defer func() { provider.CodexBase = was }()
+	ver := atomic.Value{}
+	ver.Store("0.169.1")
+	var listed atomic.Value
+	listed.Store([]string{})
+	var listedAt atomic.Int64
+	wasVer, wasListed := codexDeskVersion, codexDeskListed
+	codexDeskVersion = func() string { return ver.Load().(string) }
+	codexDeskListed = func() ([]string, time.Time, bool) {
+		return listed.Load().([]string), time.Unix(0, listedAt.Load()), true
+	}
+	t.Cleanup(func() { codexDeskVersion, codexDeskListed = wasVer, wasListed })
+	var changed atomic.Int32
+	CodexDesktopChanged = func() { changed.Add(1) }
+	has := func(slug string) bool {
+		b, ok := CodexDesktopCatalog()
+		return ok && strings.Contains(string(b), `"`+slug+`"`)
+	}
+	// the last ask is moments old: past codexDeskRetry for the next
+	allowRetry := func() {
+		codexDesk.Lock()
+		codexDesk.tried = time.Time{}
+		codexDesk.Unlock()
+	}
+
+	CodexDesktopCatalog()
+	codexDeskAsked(t)
+	if !has("gpt-6.1-sol") || asks.Load() != 1 {
+		t.Fatalf("the first list: asks %d", asks.Load())
+	}
+	list.Store(`{"models":[{"slug":"gpt-6.2-astra","priority":1,"visibility":"list","base_instructions":"You are Codex."},` +
+		`{"slug":"gpt-6.1-sol","priority":2,"visibility":"list","base_instructions":"You are Codex."}]}`)
+
+	// minutes old, nothing newer known: not asked again
+	allowRetry()
+	if has("gpt-6.2-astra") || asks.Load() != 1 {
+		t.Fatalf("a fresh list asked for again: asks %d", asks.Load())
+	}
+
+	// the sign-in's own list, asked since, has a model this one lacks
+	listed.Store([]string{"gpt-6.2-astra", "gpt-6.1-sol"})
+	listedAt.Store(time.Now().UnixNano())
+	told := changed.Load()
+	CodexDesktopCatalog()
+	codexDeskAsked(t)
+	if !has("gpt-6.2-astra") || asks.Load() != 2 {
+		t.Fatalf("the sign-in's newer list didn't bring the model: asks %d", asks.Load())
+	}
+	if changed.Load() == told {
+		t.Fatal("the new list not told, so the file isn't written again")
+	}
+	// and once asked, that list is not a reason again
+	allowRetry()
+	CodexDesktopCatalog()
+	if asks.Load() != 2 {
+		t.Fatalf("asked again with nothing newer: asks %d", asks.Load())
+	}
+
+	// magpie asks as a newer Codex now: the list asked as the older one
+	// is asked for again
+	ver.Store("0.171.0")
+	allowRetry()
+	CodexDesktopCatalog()
+	codexDeskAsked(t)
+	if asks.Load() != 3 {
+		t.Fatalf("a list asked for an older Codex not asked again: asks %d", asks.Load())
+	}
+}
+
+// The loop of the magpie serving the gateway asks for the list once it is
+// due, with no sync to start it, and tells a change, so the file is written
+// again.
+func TestKeepCodexDeskFreshAsksWhenDue(t *testing.T) {
+	codexSignedIn(t)
+	codexDeskReset(t)
+	var asks atomic.Int32
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := asks.Add(1)
+		slugs := `{"slug":"gpt-6.1-sol","priority":2,"visibility":"list"}`
+		if n > 1 {
+			slugs = `{"slug":"gpt-6.2-astra","priority":1,"visibility":"list"},` + slugs
+		}
+		io.WriteString(w, `{"models":[`+slugs+`]}`)
+	}))
+	defer up.Close()
+	was := provider.CodexBase
+	provider.CodexBase = up.URL + "/backend-api/codex"
+	defer func() { provider.CodexBase = was }()
+	wasListed := codexDeskListed
+	codexDeskListed = func() ([]string, time.Time, bool) { return nil, time.Time{}, false }
+	t.Cleanup(func() { codexDeskListed = wasListed })
+	changes := make(chan struct{}, 8)
+	CodexDesktopChanged = func() { changes <- struct{}{} }
+	waitChange := func(what string) {
+		t.Helper()
+		select {
+		case <-changes:
+		case <-time.After(30 * time.Second):
+			t.Fatalf("%s: never told (asks %d)", what, asks.Load())
+		}
+	}
+
+	wasLook := codexDeskLook
+	codexDeskLook = 20 * time.Millisecond
+	t.Cleanup(func() { codexDeskLook = wasLook })
+	ctx, cancel := context.WithCancel(context.Background())
+	ended := make(chan struct{})
+	go func() { KeepCodexDeskFresh(ctx); close(ended) }()
+	t.Cleanup(func() { cancel(); <-ended })
+
+	CodexDesktopCatalog()
+	waitChange("the first list")
+	// an hour on, as the loop sees it
+	codexDesk.Lock()
+	codexDesk.got, codexDesk.tried = time.Now().Add(-codexDeskFor), time.Time{}
+	codexDesk.Unlock()
+	waitChange("the list an hour old")
+	if b, ok := CodexDesktopCatalog(); !ok || !strings.Contains(string(b), `"gpt-6.2-astra"`) {
+		t.Fatalf("the loop's ask: %v\n%s", ok, b)
 	}
 }

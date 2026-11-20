@@ -44,9 +44,7 @@ func (s *shim) start(path string, args []string) error {
 	tty.Close()
 	s.pty, s.cmd = m, cmd
 	go func() {
-		err := cmd.Wait()
-		s.exit = err
-		close(s.exited)
+		s.ended(cmd.Wait(), false)
 	}()
 	go s.read()
 	return nil
@@ -69,3 +67,10 @@ func (s *shim) stop() {
 		_ = syscall.Kill(-s.cmd.Process.Pid, syscall.SIGKILL)
 	}
 }
+
+// imagePadOS: a terminal here passes the bracketed-paste marks (imagePad).
+const imagePadOS = 0
+
+// cutHint is what a message Claude Code didn't get whole (whole.go) is
+// told of where it was lost: nothing known here.
+func cutHint() string { return "" }

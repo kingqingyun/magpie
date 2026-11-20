@@ -13,6 +13,16 @@
 // servers are app menus (never a <select>), with a hint naming the agents
 // picked that won't bind them; Save posts subagents/save. A row opens it
 // again, and Remove asks first, then posts subagents/remove.
+// A subagent's model (luckymanjc on Discord) is an app menu of the agent's
+// pick and the models and routing groups Codex lists; only Codex takes
+// one, so the hint and an aside name the agents that run it on their own
+// pick, and the hint says when Codex's subagent model on the Agents page
+// takes its place.
+// Each is kept in a file of its own on this computer (JonahFu on X): the
+// editor shows where, a click shows it in the file manager, and Copy puts
+// the path on the clipboard; an edit there magpie couldn't read says why.
+// A file of the user's own, in a git repository say, is under Advanced,
+// folded until one is set, and Save posts it.
 // At 420 and 1100 wide in en, zh, zh-TW, ja and de: no sideways scroll,
 // and what each click pressed stays where it was on the screen.
 // No backend: the API is faked here.
@@ -31,18 +41,20 @@ const sa = (name, description, prompt, skills, mcp, agents) => ({ name, descript
 const WSL = "claude@wsl:Ubuntu";
 const SUB_AGENTS = [
   { id: "claude", dir: `${HOME}/.claude/agents`, skills: true, mcp: true },
-  { id: "codex", dir: `${HOME}/.codex/agents` },
+  { id: "codex", dir: `${HOME}/.codex/agents`, model: true },
   { id: "cursor", dir: `${HOME}/.cursor/agents` },
   { id: "droid", dir: `${HOME}/.factory/droids`, mcp: true },
   { id: "opencode", dir: `${HOME}/.config/opencode/agents` },
   { id: WSL, wsl: true, no: "magpie gives no subagents to an agent in WSL yet" },
 ];
-const lib = (subagents) => ({
+const MODELS = [{ id: "openai/gpt-6-sol", name: "GPT-6 Sol", note: "OpenAI" }, { id: "group/review", name: "review", group: true }];
+const lib = (subagents, held = "") => ({
   dir: `${HOME}/.magpie/library`, backups: `${HOME}/.magpie/backups`, home: HOME,
   agents: [agent("claude", "Claude Code"), agent("codex", "Codex"), agent("cursor", "Cursor"), agent("droid", "Droid"), agent("opencode", "OpenCode"), agent(WSL, "Claude Code (Ubuntu)")],
   instructions: { agents: [] }, servers: [{ name: "github", transport: "stdio", command: "npx", agents: ["claude"] }],
   skills: [{ name: "tdd", agents: ["claude"] }], foundServers: [], projects: [], foundSkills: [], problems: [],
   hooks: [], hookAgents: [], subagents, subagentAgents: SUB_AGENTS,
+  subagentModels: MODELS, ...(held ? { codexSubagentModel: held } : {}),
 });
 
 let I18N;
@@ -56,21 +68,25 @@ function tr(lang, key, vars = {}) {
   return s.replace(/\{(\w+)\}/g, (m, k) => (k in vars ? String(vars[k]) : m));
 }
 
-function server(lang, state, posts) {
+const FILE = `${HOME}/.magpie/library/subagents/reviewer.md`, OWN = `${HOME}/code/agents/test-writer.md`;
+const BAD = `magpie can't read ${FILE}: it has no front matter. The agents keep what it said before.`;
+
+function server(lang, state, posts, reveals = []) {
   return async (route) => {
     const req = route.request(), url = new URL(req.url());
     const json = (data) => route.fulfill({ json: data });
     if (url.pathname === "/boot.js") return route.fulfill({ contentType: "text/javascript", body: `window.bootPrefs = {lang:"${lang}",theme:"light",web:true};` });
     if (url.pathname === "/wails/runtime.js") return route.fulfill({ contentType: "text/javascript", body: "export const Window = {};" });
     if (url.pathname === "/api/state") return json({ agents: [], profiles: [], settings: { lang, theme: "light" } });
-    if (url.pathname === "/api/library") return json(lib(state.subagents));
-    if (url.pathname.startsWith("/api/library/") && req.method() === "POST" && !url.pathname.endsWith("/reveal")) {
+    if (url.pathname === "/api/library") return json(lib(state.subagents, state.held));
+    if (url.pathname === "/api/library/reveal") { reveals.push(req.postDataJSON().path); return json({}); }
+    if (url.pathname.startsWith("/api/library/") && req.method() === "POST") {
       const body = req.postDataJSON(), what = url.pathname.replace("/api/library/", "");
       posts.push({ what, body });
       if (what === "subagents/agents") state.subagents = state.subagents.map((x) => (x.name === body.name ? { ...x, agents: body.agents.filter((a) => a !== WSL) } : x));
-      if (what === "subagents/save") state.subagents = [...state.subagents.filter((x) => x.name !== body.old), body.subagent];
+      if (what === "subagents/save") state.subagents = [...state.subagents.filter((x) => x.name !== body.old), { ...body.subagent, path: body.subagent.file || `${HOME}/.magpie/library/subagents/${body.subagent.name}.md` }];
       if (what === "subagents/remove") state.subagents = state.subagents.filter((x) => x.name !== body.name);
-      return json({ ...lib(state.subagents), result: { changed: ["claude"] } });
+      return json({ ...lib(state.subagents, state.held), result: { changed: ["claude"] } });
     }
     if (url.pathname === "/api/plugins") return json({ plugins: [] });
     if (url.pathname === "/api/usage/quotas") return json([]);
@@ -121,8 +137,8 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
     for (const lang of ["en", "zh", "zh-TW", "ja", "de"]) {
       await t.test(lang, async () => {
         const w = (key, vars) => tr(lang, key, vars);
-        const state = { subagents: [sa("reviewer", LONG, "You review code.\n\nReport bugs only.", ["tdd"], ["github"], ["claude", "codex"])] };
-        const posts = [], errors = [];
+        const state = { subagents: [{ ...sa("reviewer", LONG, "You review code.\n\nReport bugs only.", ["tdd"], ["github"], ["claude", "codex"]), path: FILE, fileError: BAD }] };
+        const posts = [], errors = [], reveals = [];
         const open = async (width) => {
           const ctx = await browser.newContext({ viewport: { width, height: 1000 }, reducedMotion: "reduce" });
           await ctx.addInitScript(() => { try { localStorage.setItem("magpie.libTab", "subagents"); } catch {} });
@@ -131,7 +147,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
           page.setDefaultNavigationTimeout(60000);
           page.on("pageerror", (e) => errors.push(e.message));
           page.on("dialog", (d) => { errors.push("a browser dialog: " + d.message()); d.dismiss(); });
-          await page.route("**/*", server(lang, state, posts));
+          await page.route("**/*", server(lang, state, posts, reveals));
           await page.goto("http://magpie.test/");
           await page.locator('button[data-view="library"]').click();
           await page.locator("#view-library .lib-subagent").first().waitFor();
@@ -165,7 +181,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
 
         // the tab, with its count, between Hooks and RTK
         const tabs = (await v.locator(".lib-tabs button").allTextContents()).map((x) => x.trim());
-        assert.deepEqual(tabs.slice(3, 6), [w("Hooks"), w("Subagents") + " · 1", "RTK"]);
+        assert.deepEqual(tabs.slice(4, 11), [w("Hooks"), w("Environment variables"), w("Subagents") + " · 1", w("Slash commands"), w("Rules"), w("Claude plugins"), "RTK"]);
         // the row: what it is for, and what it binds
         assert.equal((await row("reviewer").locator(".lib-subagentdesc").textContent()).trim(), LONG);
         assert.equal((await row("reviewer").locator(".lib-subagentuses").textContent()).trim(), w("Skills: {names}", { names: "tdd" }) + " · " + w("MCP servers: {names}", { names: "github" }));
@@ -192,8 +208,8 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         await page.waitForTimeout(200);
         assert.deepEqual(posts.shift(), { what: "subagents/agents", body: { name: "reviewer", agents: ["claude", "codex", "cursor"] } });
         assert.deepEqual(agentsOf("reviewer"), ["claude", "codex", "cursor"]);
-        await press(page, v.locator(".lib-tabs button").nth(3));
-        await press(page, v.locator(".lib-tabs button").nth(4));
+        await press(page, v.locator(".lib-tabs button").nth(5));
+        await press(page, v.locator(".lib-tabs button").nth(6));
         await v.locator(".lib-subagents-cursor").filter({ hasText: w("The Cursor app has these subagents; its cursor-agent command reads only a project's own .cursor/agents.") }).waitFor();
         await v.locator(".lib-subagents-noskills").filter({ hasText: w("{agents} can't bind skills to a subagent: theirs gets its prompt, and every skill the agent has.", { agents: "Codex, Cursor" }) }).waitFor();
 
@@ -204,6 +220,12 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         await settled(page);
         assert.equal(await page.locator("#modal select").count(), 0, "a native <select>");
         assert.equal((await ed.locator(".ehead b").textContent()).trim(), w("New subagent"));
+        // a new one has no file yet; one of the user's own is under
+        // Advanced, folded
+        assert.equal(await ed.locator(".lib-subagentfile").count(), 0, "a file line for a subagent not saved yet");
+        const more = ed.locator(".lib-subagentmore");
+        assert.equal(await more.evaluate((d) => d.open), false, "Advanced open at first");
+        assert.equal((await more.locator("summary").textContent()).trim(), w("Advanced"));
         const edChip = (id) => ed.locator(`.lib-ag[data-agent="${id}"]`);
         for (const id of ["claude", "codex", "cursor", "droid", "opencode"]) assert.equal(await edChip(id).getAttribute("aria-pressed"), "true", id);
         assert.equal(await edChip(WSL).getAttribute("aria-pressed"), "false");
@@ -230,6 +252,20 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         assert.equal((await hint("mcp").textContent()).trim(), w("Not bound for {agents}: theirs uses every server the agent has", { agents: "Codex, Cursor, OpenCode" }));
         await edChip("opencode").click();
         assert.equal((await hint("mcp").textContent()).trim(), w("Not bound for {agents}: theirs uses every server the agent has", { agents: "Codex, Cursor" }));
+        // the model from an app menu: the agent's pick at first, then a
+        // routing group, which only Codex is given
+        assert.equal((await ed.locator(".lib-subagentmodel").textContent()).trim(), w("Picked by the agent"));
+        assert.equal((await hint("model").textContent()).trim(), w("Each agent runs it on the model it picks for a subagent"));
+        await ed.locator(".lib-subagentmodel").click();
+        const mmenu = page.locator(".proto-menu");
+        await mmenu.waitFor();
+        assert.equal((await mmenu.locator(".pm-head").textContent()).trim(), w("Model"));
+        assert.deepEqual((await mmenu.locator(".pm-name").allTextContents()).map((x) => x.trim()), [w("Picked by the agent"), "GPT-6 Sol", "review"]);
+        assert.equal((await mmenu.locator(".pm-item", { hasText: "review" }).locator(".pm-note").textContent()).trim(), w("routing group"));
+        await mmenu.locator(".pm-item", { hasText: "review" }).click();
+        await mmenu.waitFor({ state: "detached" });
+        assert.equal((await ed.locator(".lib-subagentmodel").textContent()).trim(), "review");
+        assert.equal((await hint("model").textContent()).trim(), w("Not set for {agents}: theirs runs on the model the agent picks", { agents: "Claude Code, Cursor, Droid" }));
         // the skills from an app menu
         assert.equal((await ed.locator(".lib-subagentskills").textContent()).trim(), w("None"));
         await ed.locator(".lib-subagentskills").click();
@@ -242,12 +278,20 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         await menu.waitFor({ state: "detached" });
         assert.equal((await ed.locator(".lib-subagentskills").textContent()).trim(), "tdd");
         await ed.waitFor();
+        // kept in a file of the user's own, in a repository
+        await more.locator("summary").click();
+        await ed.locator(".lib-subagentownfile").fill(" " + OWN + " ");
+        assert.equal(await ed.locator(".lib-subagentownfile").getAttribute("placeholder"), "~/code/agents/test-writer.md");
+        await more.getByText(w("A Markdown file anywhere, in a git repository say. One there already is what the subagent says."), { exact: true }).waitFor();
         assert.deepEqual(await sideways(page), [], "sideways scroll in the editor");
         await ed.locator(".bar button.primary").click();
         await ed.waitFor({ state: "detached" });
-        assert.deepEqual(posts.shift(), { what: "subagents/save", body: { old: "", subagent: { name: "test-writer", description: "写测试", prompt: "Write tests first.\nThen run them.", skills: ["tdd"], mcp: [], agents: ["claude", "codex", "cursor", "droid"] } } });
+        assert.deepEqual(posts.shift(), { what: "subagents/save", body: { old: "", subagent: { name: "test-writer", description: "写测试", prompt: "Write tests first.\nThen run them.", model: "group/review", skills: ["tdd"], mcp: [], agents: ["claude", "codex", "cursor", "droid"], file: OWN } } });
         await row("test-writer").waitFor();
-        assert.equal((await row("test-writer").locator(".lib-subagentuses").textContent()).trim(), w("Skills: {names}", { names: "tdd" }));
+        assert.equal((await row("test-writer").locator(".lib-subagentuses").textContent()).trim(), w("Model: {name}", { name: "review" }) + " · " + w("Skills: {names}", { names: "tdd" }));
+        await v.locator(".lib-subagents-nomodel").filter({ hasText: w("{agents} can't be given a subagent's model: theirs runs on the model the agent picks.", { agents: "Claude Code, Cursor, Droid" }) }).waitFor();
+        // Codex's subagent model set on the Agents page from here on
+        state.held = "lead";
 
         // a row opens it again; Remove asks first, Cancel posts nothing
         await press(page, row("reviewer"));
@@ -256,6 +300,17 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         assert.equal((await ed.locator(".ehead b").textContent()).trim(), "reviewer");
         assert.equal(await ed.locator(".lib-subagentprompt").inputValue(), "You review code.\n\nReport bugs only.");
         assert.equal((await ed.locator(".lib-subagentmcp").textContent()).trim(), "github");
+        // where it is kept: shown in the file manager on a click, and why
+        // the edit made there wasn't taken in
+        const file = ed.locator(".lib-subagentfile");
+        assert.equal((await file.locator(".lib-path").textContent()).trim(), "~/.magpie/library/subagents/reviewer.md");
+        await ed.getByText(w("Edit it in any editor or agent: magpie takes the change in and gives it to the agents"), { exact: true }).waitFor();
+        assert.equal((await ed.locator(".lib-subagentfile-err").textContent()).trim(), BAD);
+        await file.locator(".lib-path").click();
+        for (let i = 0; !reveals.length && i < 100; i++) await new Promise((r) => setTimeout(r, 50));
+        assert.deepEqual(reveals, [FILE]);
+        assert.equal(await file.locator("button.copy").count(), 1);
+        assert.equal(await ed.locator(".lib-subagentmore").evaluate((d) => d.open), false, "Advanced open with no file of the user's own");
         await ed.locator(".bar button.danger").click();
         const sheet = page.locator("dialog.action-confirm");
         await sheet.waitFor();
@@ -270,6 +325,19 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         assert.deepEqual(posts.shift(), { what: "subagents/remove", body: { name: "reviewer" } });
         assert.equal(await row("reviewer").count(), 0);
         await row("test-writer").waitFor();
+        // opened again: its model, and that Codex's Agents page one takes its place
+        await press(page, row("test-writer"));
+        await ed.waitFor();
+        await settled(page);
+        assert.equal((await ed.locator(".lib-subagentmodel").textContent()).trim(), "review");
+        // kept in the user's file: shown, and Advanced open with it
+        assert.equal((await ed.locator(".lib-subagentfile .lib-path").textContent()).trim(), "~/code/agents/test-writer.md");
+        assert.equal(await ed.locator(".lib-subagentmore").evaluate((d) => d.open), true, "Advanced folded over the user's file");
+        assert.equal(await ed.locator(".lib-subagentownfile").inputValue(), OWN);
+        assert.equal(await ed.locator(".lib-subagentfile-err").count(), 0);
+        assert.equal((await hint("model").textContent()).trim(), w("Not set for {agents}: theirs runs on the model the agent picks", { agents: "Claude Code, Cursor, Droid" }) + " · " + w("Codex's subagent model on the Agents page is set, and takes the place of this one"));
+        await ed.locator(".bar button", { hasText: w("Cancel") }).click();
+        await ed.waitFor({ state: "detached" });
 
         assert.deepEqual(posts, []);
         assert.deepEqual(errors, []);

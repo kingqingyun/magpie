@@ -50,6 +50,13 @@ import (
 	"github.com/yetone/magpie/internal/lastgood"
 )
 
+// ClaudeThroughMagpie is set by the agent package: whether Claude Code's
+// settings send its requests to magpie's gateway (ANTHROPIC_BASE_URL),
+// whatever its model and however it signs in there. NextLogin then never
+// moves its sign-in off a spent account. false until it is set, and in a
+// process without the agent package.
+var ClaudeThroughMagpie = func() bool { return false }
+
 // loginSwitchEvery is how often the account each agent is on is looked at.
 const loginSwitchEvery = 5 * time.Minute
 
@@ -84,6 +91,42 @@ func codexLookEvery(u map[string]SubscriptionQuota) time.Duration {
 		}
 	}
 	return loginSwitchEvery
+}
+
+// codexIdleAfter is how long no Codex session file has been written for
+// Codex to count idle, and codexIdleLookEvery how often the account Codex
+// is signed in to is read then, in place of loginSwitchEvery: nothing
+// runs on the account, so a reading every five minutes told nothing new
+// and asked chatgpt.com 288 times a day (dludream on Discord). Requests
+// magpie sends on the account keep its windows current from what each
+// reply says (NoteCodexLimits), and a session written to again has the
+// next look read it at once (codexDue).
+const (
+	codexIdleAfter     = 30 * time.Minute
+	codexIdleLookEvery = 30 * time.Minute
+)
+
+// codexIdle says whether Codex has written no session in codexIdleAfter.
+// A var so tests can say.
+var codexIdle = func(now time.Time) bool {
+	return codexSessionsQuiet(codexHome(), now, codexIdleAfter)
+}
+
+// codexDue says whether a full look of KeepOnAnAccountWithRoom reads
+// Codex's accounts at now: next, when the last look set it, has come, or
+// that look found Codex idle (idle) and it no longer is.
+func codexDue(now, next time.Time, idle bool) bool {
+	return !now.Before(next) || idle && !codexIdle(now)
+}
+
+// codexEveryAt is how long after a look at now the next reads Codex's
+// accounts, given every (codexLookEvery), and whether that is for Codex
+// being idle: only an account not near out waits the longer while idle.
+func codexEveryAt(every time.Duration, now time.Time) (time.Duration, bool) {
+	if every >= loginSwitchEvery && codexIdle(now) {
+		return codexIdleLookEvery, true
+	}
+	return every, false
 }
 
 // CodexOutUntil is when the ChatGPT account Codex is signed in to has room
@@ -242,6 +285,11 @@ func NextLogin(ctx context.Context, agent string) (from, to string, back, ok boo
 	if leftAlone(agent) {
 		return "", "", false, false // magpie has no say in its sign-in, or was told to leave it be
 	}
+	if agent == "claude" && claudeTokenInUse() != "" {
+		// on a setup-token the user switched it to, whose allowance can't
+		// be read: it stays there till they switch it again
+		return "", "", false, false
+	}
 	var spares []Login
 	var first *Login
 	ls := Logins(agent)
@@ -249,13 +297,13 @@ func NextLogin(ctx context.Context, agent string) (from, to string, back, ok boo
 		switch {
 		case l.Active:
 			from = l.User
-		case l.Returns:
+		case l.Returns && switchable(l):
 			first = &ls[i]
 		}
 		// never one Codex keeps signed in in another folder (switchSavedLogin)
 		// nor one added by a setup-token, which Claude Code can't be
-		// signed in to
-		if !l.Active && l.On && l.Lapsed == "" && l.home == "" && !l.Token {
+		// signed in to, nor one kept access token only (switchable)
+		if !l.Active && l.On && l.Lapsed == "" && switchable(l) {
 			spares = append(spares, l)
 		}
 	}
@@ -300,6 +348,18 @@ func NextLogin(ctx context.Context, agent string) (from, to string, back, ok boo
 		if q, known := u[first.User]; known && q.Error == "" && !q.Held && !usedPast(q, backShare, now) && !capped(first.User, q) {
 			return from, first.User, true, true
 		}
+	}
+	// Claude Code sending its requests to the gateway: the gateway moves
+	// them on to an account with room by itself, so the sign-in moved off
+	// a spent account served nothing and only took away what Claude Code
+	// has as that account, its claude.ai connectors (MCP) among them. The
+	// user set Claude Code back to their main account over and over, and
+	// magpie moved it to their quota account again each time (oreoft on
+	// Discord). It stays where the user put it then; moving it is all
+	// magpie is asked to do under SwitchOnly, whose accounts the gateway
+	// doesn't serve.
+	if agent == "claude" && ClaudeThroughMagpie() && !SwitchOnly(agent) {
+		return "", "", false, false
 	}
 	// kept on the first, it stays there however little that has left; and
 	// it moves on at the share its routing counts the account spent at.
@@ -375,8 +435,8 @@ func roomLeft(q SubscriptionQuota, share float64, caps WindowCaps, now time.Time
 			continue
 		}
 		line := share
-		if c, _ := caps.Of(w.Name); c > 0 && float64(c) < line {
-			line = float64(c)
+		if c, _, _ := caps.limitShare(w.Name, w.Limit, false); c > 0 && c < line {
+			line = c
 		}
 		room = min(room, line-w.Used)
 	}
@@ -446,7 +506,7 @@ func NextInOrder(ctx context.Context, agent string) (to string, over bool, err e
 // by: never read (a /usage not run), or a read that failed for a reason
 // not the account's own. Its /usage is then run (readSpare).
 func unreadSpare(q SubscriptionQuota) bool {
-	return q.Error != "" && (readDeferred(q.Error) || !claudeUsageDenied.MatchString(q.Error))
+	return q.Error != "" && (readDeferred(q.Error) || !claudeDenied(q.Error))
 }
 
 // readSpare is the reading of the saved Claude account l, its /usage run
@@ -576,9 +636,14 @@ var codexWasUsedUp atomic.Bool
 // room again: the Codex app sends nothing at all for an account that is
 // out, a magpie model's turn included, so the agent package then makes
 // magpie Codex's provider, and puts it back beside the sign-in after
-// (#540). Only a change is told.
-func noteCodexUsedUp(now bool) {
-	if codexWasUsedUp.Swap(now) != now {
+// (#540). Only a change is told: from the last look's answer, or from
+// known, what CodexUsedUpKnown said before this look read again, which
+// is what the sync last went by. Codex signed in by hand to an account
+// whose kept reading said held made magpie its provider at that sync,
+// and the look's fresh "room" was the same as its last answer (for the
+// account Codex was on before), so nothing told the sync again.
+func noteCodexUsedUp(known, now bool) {
+	if codexWasUsedUp.Swap(now) != now || known != now {
 		catalog.Touched()
 	}
 }
@@ -600,6 +665,10 @@ func KeepOnAnAccountWithRoom(ctx context.Context) {
 		}
 	}()
 	var full time.Time // when the next full look is due; zero: now
+	// when a full look next reads Codex's accounts (zero: the first), and
+	// whether the last that did found Codex idle
+	var codexNext time.Time
+	codexWasIdle := false
 	for {
 		select {
 		case <-ctx.Done():
@@ -622,23 +691,75 @@ func KeepOnAnAccountWithRoom(ctx context.Context) {
 			t.Reset(min(time.Until(full), claudeLookEvery))
 			continue
 		}
+		now := time.Now()
+		readCodex := codexDue(now, codexNext, codexWasIdle)
+		// what the sync last went by, before this look reads again
+		known := readCodex && CodexUsedUpKnown()
 		for _, agent := range switchedAgents {
+			if agent == "codex" && !readCodex {
+				continue
+			}
 			lookAtSignIn(ctx, agent)
 		}
 		// a sign-in made in Claude Code itself, or a proxy picked since,
 		// takes its account's proxy too (#1807)
 		syncClaudeProxyEnvNow()
-		c, cancel := context.WithTimeout(ctx, time.Minute)
-		noteCodexUsedUp(CodexUsedUp(c))
-		cancel()
+		if readCodex {
+			c, cancel := context.WithTimeout(ctx, time.Minute)
+			noteCodexUsedUp(known, CodexUsedUp(c))
+			restartCodexAppLeftOnSpent(c)
+			cancel()
+			var codexEvery time.Duration
+			codexEvery, codexWasIdle = codexEveryAt(codexLookEvery(knownLoginUsage("codex")), time.Now())
+			codexNext = time.Now().Add(codexEvery)
+		}
 		// Codex's own sign-in refused for good, or signed in again since
 		noteCodexGoneNow()
-		every := codexLookEvery(knownLoginUsage("codex"))
+		every := min(loginSwitchEvery, max(time.Until(codexNext), 0))
 		full = time.Now().Add(every)
 		signInsLooked(true)
 		t.Reset(min(every, claudeLookEvery))
 	}
 }
+
+// restartCodexAppLeftOnSpent has the Codex app's app-server restarted, as
+// a switch off a used-up account has it (codexAppSwitched spent), when it
+// is still on an account Codex was switched off (CodexAppStale) and that
+// account is now held (codexHeld). magpie's switch back to the first, or to
+// the account Codex is kept signed in to, leaves the app running unless
+// RestartApp is on, and the app-server keeps the account it started on:
+// once that one ran out, the app greyed Send for every model, magpie's and
+// another provider's too, while magpie read only the account Codex is
+// signed in to, which had room, and never restarted it (nb5p on Discord:
+// B first in magpie, the app on A). Once for each app-server left.
+func restartCodexAppLeftOnSpent(ctx context.Context) {
+	was := CodexAppStale()
+	if was == "" {
+		return
+	}
+	codexDaemonMu.Lock()
+	left := codexAppLeft
+	done := left == codexAppLeftRestarted
+	codexDaemonMu.Unlock()
+	if done || !strings.EqualFold(left.user, was) {
+		return
+	}
+	for user, q := range someLoginUsage(ctx, "codex", was) {
+		if !strings.EqualFold(user, was) || q.Error != "" || !q.Held {
+			continue
+		}
+		codexDaemonMu.Lock()
+		codexAppLeftRestarted = left
+		codexDaemonMu.Unlock()
+		log.Printf("codex: the Codex app is still signed in to %s, which is used up; its app-server is restarted once no Codex turn runs, for the app to read the account Codex is signed in to", was)
+		codexAppSwitched(true, false)
+		return
+	}
+}
+
+// codexAppLeftRestarted is the app-server left on an account that
+// restartCodexAppLeftOnSpent last had restarted. codexDaemonMu is held.
+var codexAppLeftRestarted leftDaemon
 
 // firstSignInLook is when KeepOnAnAccountWithRoom first looks. A var so
 // tests can say.
