@@ -227,6 +227,7 @@ func clearRest(key string) {
 	kept := ladderRest(restingUntil.note[key])
 	delete(restingUntil.m, key)
 	delete(restingUntil.note, key)
+	delete(restingUntil.askedResting, key) // back, it is handed requests again
 	restingUntil.Unlock()
 	if kept {
 		saveRests() // its rung starts over after a restart too
@@ -1576,6 +1577,12 @@ func (s *Server) restAfterMarked(c candidate, status int, header http.Header, bo
 		// was, and is asked again once the network is back (offline.go)
 		return Rest{Why: failOffline, Status: status, By: "off", Until: now}
 	}
+	if lanUnreached(c, status, body) {
+		// a Remote magpie on a network this computer isn't on now: it
+		// is passed over while it can't be reached, and asked again the
+		// moment it can (lan_reach.go)
+		return Rest{Why: why, Status: status, By: "off", Until: now}
+	}
 	if regionRefused(status, wordsOf(body)) {
 		// the vendor refused where the request came from (regionWords):
 		// the network's doing, and the edge's the connection reached, not
@@ -1989,7 +1996,20 @@ func (s *Server) restAfterMarked(c candidate, status int, header http.Header, bo
 		restingUntil.m[id] = r.Until
 		restingUntil.note[id] = r
 	}
+	standing := restingUntil.m[id]
 	restingUntil.Unlock()
+	if a := c.p.Account; a != nil && a.UsageAgent() == "claude" && why == failQuota && id == c.restKey() {
+		// a Claude account rested whole for its allowance is out for the
+		// switch too, till the same time (claude-limits.json): it moved
+		// Claude Code onto an account the gateway had set aside. A rest
+		// of one model (Fable's own limit) leaves the account in
+		provider.NoteClaudeOut(a.User, standing, r.said, r.By == "resets" || r.By == "window" || r.By == "retry-after")
+	} else if a != nil && a.UsageAgent() == "claude" && why == failQuota && id == c.restID() {
+		// and rested for its model's family alone (Anthropic's "You've
+		// hit your Fable limit"), it is out for that family alone: the
+		// switch still takes it as a spare for Claude Code on Opus
+		provider.NoteClaudeModelOut(a.User, c.model, standing, r.said, r.By == "resets" || r.By == "window" || r.By == "retry-after")
+	}
 	if id == c.restKey() && (why == failQuota || why == failCredit) {
 		// a pool routed Until used up goes on from it, though it renews
 		// before the pool's next request (dzxx0496); one model of it
@@ -2340,7 +2360,17 @@ func (c candidate) full(now time.Time) time.Time {
 	if spendsCredits(c.p, a) || c.p.Account == nil && a.OnCredits() {
 		return time.Time{}
 	}
-	return a.Full(c.model, provider.SpentShareOf(c.p.Routing), now)
+	full := a.Full(c.model, provider.SpentShareOf(c.p.Routing), now)
+	// a Claude account Claude Code said is out for the model's family
+	// alone ("You've hit your Fable limit", claude-limits.json: from the
+	// warm-up, a /usage run or a refusal it wrote) is full for that
+	// family's models till the reset it named, and not for the others
+	if acct := c.p.Account; acct != nil && acct.UsageAgent() == "claude" {
+		if t := provider.ClaudeModelOutUntil(acct.User, c.model, now); t.After(full) {
+			full = t
+		}
+	}
+	return full
 }
 
 // onCredits: c is a Codex account that goes on past its allowance on its
@@ -2848,7 +2878,8 @@ func weighRouted(p provider.Provider, cs []candidate, model string, from provide
 		}
 		seats[i] = routes.Seat{Key: c.rest, Account: c.p.Account != nil, Known: known, Learns: learns(c, wg.lefts),
 			Used: l.used, WeekLow: l.weekLow, Soon: l.soon, Unreached: l.unreached, Lapse: l.lapse, Lapsing: l.lapsing, Pace: pace, Weight: keyWeight(c), Resting: resting(c), Tokens: routed.used[c.restKey()].now(now), Credits: l.credits, First: l.first,
-			Left: l.bal, LeftIn: l.balIn, Spent: spentRest(c), Lead: c.p.UseFirst}
+			Trial: l.credits && c.p.Account != nil && strings.HasPrefix(c.p.Account.UsageAgent(), "plugin:"),
+			Left:  l.bal, LeftIn: l.balIn, Spent: spentRest(c), Lead: c.p.UseFirst}
 	}
 	routed.Unlock()
 	if st.ByUse {

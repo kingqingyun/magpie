@@ -962,6 +962,7 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 		// and, when settings say to, starts its accounts' next windows as the last reset
 		go provider.KeepCodexWindowsWarm(ctx)
 		go provider.KeepClaudeWindowsWarm(ctx, warmClaude)
+		go provider.KeepAgyWindowsWarm(ctx)
 		// and spends a Codex reset about to run out unused, for the accounts
 		// that let it
 		go provider.KeepResetsFromRunningOut(ctx)
@@ -2308,7 +2309,7 @@ func (s *Server) countTokens(w http.ResponseWriter, r *http.Request) {
 	// conversation: refused as the request itself would be, not sent to
 	// the vendor's count_tokens (coeo91 on Discord: OpenRouter refuses a
 	// decisions model anywhere but its decisions endpoint)
-	if ok && p.DecidesModel(model) {
+	if ok && p.OnlyDecides(model) {
 		writeError(w, provider.Anthropic, 400, decisionModelRefused(named))
 		return
 	}
@@ -3044,7 +3045,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 		turnedAway()
 		return
 	}
-	if p.DecidesModel(model) {
+	if p.OnlyDecides(model) {
 		// Jev answers questions about a message, not the message
 		call.Status, call.Error = 400, "a decision model"
 		writeError(w, from, 400, decisionModelRefused(call.Model))
@@ -3747,7 +3748,11 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 	// of those resting, only the one back soonest is asked (#1799); the
 	// whole list still finds a Codex account to spend a reset on
 	all := cands
-	cands = probeOne(cands)
+	var restLeft []candidate
+	cands, restLeft = probeLeft(cands)
+	// those it left out resting only for a while magpie guessed are asked
+	// next, once every one asked has failed for itself (briefLeftOf)
+	briefLeft := briefLeftOf(restLeft)
 	var cacheReport *Request
 	if wantsClientCache(r, from) && slices.ContainsFunc(cands, func(c candidate) bool { return c.p.Account != nil && c.p.Account.Agent == "claude" }) {
 		var err error
@@ -3950,6 +3955,18 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 			// (le13ure on X)
 			c.p = q
 		}
+		if i < len(cands)-1 && lanUnreachable(c.p) {
+			// a Remote magpie on a network this computer isn't on now
+			// (AlanWang1027713 on X): the next is asked at once, and
+			// nothing is held against this one (lan_reach.go)
+			skipped = append(skipped, c.label()+": "+unreachableSaid)
+			continue
+		}
+		if len(restLeft) > 0 {
+			// asked while it rests, as the one back soonest is, it isn't
+			// handed another request for a while (handOnEvery)
+			noteAskedResting(c)
+		}
 		if handed.release != nil && handed.who != c.who() {
 			handed.release()
 			handed.release = nil
@@ -4150,7 +4167,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 		// asked again, of it or of the next candidate. Only a stream the
 		// agent has the headers of already is held, to be told in it
 		pass := c.p.PassesErrors()
-		hw := newHoldWriter(w, kept.sent || !pass && (!last || again < max(lastRetries, rateRetries) || other != nil || autoPicks(c) && repicked < 2 ||
+		hw := newHoldWriter(w, kept.sent || !pass && (!last || len(briefLeft) > 0 || again < max(lastRetries, rateRetries) || other != nil || autoPicks(c) && repicked < 2 ||
 			patience > 0 && rounds < replanRounds && (waitFrom.IsZero() || time.Since(waitFrom) < patience) || wantWhole))
 		// a compaction's summary is held to its end, for a cut or an
 		// error halfway to go to the next candidate (#2274)
@@ -4970,6 +4987,26 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 			continue
 		}
 		watched.attempt(call, try, c.p.ID, sent, hw, capture)
+		if last && len(briefLeft) > 0 && hw.failed() && !hw.refused && !hw.turnedAway && hw.mayAskAgain() &&
+			!routedThere(hw.header) {
+			// the last one asked failed for something of its own, not
+			// the request's (failed: rate limited, busy, a 5xx, no
+			// connection, its key or allowance), and a member left out
+			// as resting only for a while magpie guessed may answer now
+			// (briefLeftOf): it is asked next, as one after this in the
+			// order would be, rather than this one again until the agent
+			// has its error (justforlxz on X). This one fails over as
+			// any before the last does, and rests as it would. A
+			// failure about the request (a 400) isn't failed, and the
+			// vendor's safety filter (refused) or a prompt turned away
+			// is the request's too. A member asked while it rested in
+			// the last handOnEvery isn't handed it, so a group down whole
+			// isn't asked every member a request (#1799)
+			if m, more, ok := nextBrief(briefLeft, busyFor(c, hw.code(), hw.errBody())); ok {
+				cands, briefLeft = append(slices.Clip(cands), m), more
+				last = false
+			}
+		}
 		if autoPicks(c) && repicked < 2 && !hw.passing && hw.code() == http.StatusBadRequest &&
 			(provider.CopilotRefusal(hw.errBody()) || wrongEndpoint(hw.code(), hw.errBody())) {
 			// Copilot refused the model its Auto picked, and Auto has
@@ -5339,6 +5376,17 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 				other = &Try{Status: call.Status, Error: call.Error, errType: call.Usage.ErrType}
 			}
 			try.Fail = failOffline
+			s.trace.update(tr, func(t *Route) { t.Tries[len(t.Tries)-1] = try })
+			skipped = append(skipped, c.label()+": "+call.Error)
+			continue
+		}
+		if !last && hw.failed() && lanUnreached(c, hw.code(), hw.errBody()) {
+			// a Remote magpie on a LAN took no connection: the network's
+			// doing, not its own, so it doesn't rest; it is passed over
+			// while it can't be reached (lan_reach.go)
+			if other == nil {
+				other = &Try{Status: call.Status, Error: call.Error, errType: call.Usage.ErrType}
+			}
 			s.trace.update(tr, func(t *Route) { t.Tries[len(t.Tries)-1] = try })
 			skipped = append(skipped, c.label()+": "+call.Error)
 			continue
@@ -6463,6 +6511,8 @@ func (s *Server) forward(ctx context.Context, p provider.Provider, to provider.P
 			heardReply(ctx, p, res)
 			noteWireModel(ctx, p, res)
 			heardNet() // the network is up (offline.go)
+			// a Remote magpie on a LAN answered (lan_reach.go)
+			noteReach(p, true)
 		}
 	}()
 	// a way of a key's request that asks outside serve's tries waits for
@@ -6481,6 +6531,11 @@ func (s *Server) forward(ctx context.Context, p provider.Provider, to provider.P
 		if q, ok := provider.SeekMoved(ctx, p, err); ok {
 			p = q
 			res, err = s.forwardOnce(ctx, p, to, path, body, in)
+		}
+		if err != nil && ctx.Err() == nil && connFailed.MatchString(err.Error()) && !proxyDown.MatchString(err.Error()) {
+			// nobody took the connection: a group passes it over on
+			// this network until it is reachable again (lan_reach.go)
+			noteReach(p, false)
 		}
 	}
 	if err == nil && res.StatusCode >= 400 {
