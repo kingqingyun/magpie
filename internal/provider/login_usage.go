@@ -547,8 +547,12 @@ func loginQuota(ctx context.Context, l Login) SubscriptionQuota {
 			}
 		} else {
 			var plan string
-			if plan, q.Windows, q.Resets, q.Balance, q.Held, err = codexWindowsRenewing(ctx, tok, accountID, renew); plan != "" {
+			var left *float64
+			if plan, q.Windows, q.Resets, q.Balance, left, q.Held, err = codexWindowsLeftRenewing(ctx, tok, accountID, renew); plan != "" {
 				q.Plan = plan
+			}
+			if err == nil {
+				noteWeekCredits(l.User, q.Windows, q.Resets, left, time.Now())
 			}
 			q.Until = codexUntil(codexLoginAuth(l), time.Now())
 		}
@@ -716,8 +720,9 @@ func codexLoginAuth(l Login) []byte {
 	for _, x := range readLogins() {
 		if x.Agent == "codex" && strings.EqualFold(x.User, l.User) {
 			// as Codex keeps it in its other folder, when it is signed in there
+			// on this account's workspace (codexOtherWorkspace)
 			if home := codexHeldIn(x); home != "" {
-				if b, _, err := readCodexLogin(home, false); err == nil {
+				if b, _, err := readCodexLogin(home, false); err == nil && !codexOtherWorkspace(x, b) {
 					return b
 				}
 			}
